@@ -1,5 +1,8 @@
 certifi==2026.1.4
 jplephem==2.24
 numpy==2.4.2
+pandas==3.0.1
+python-dateutil==2.9.0.post0
 sgp4==2.25
+six==1.17.0
 skyfield==1.54
