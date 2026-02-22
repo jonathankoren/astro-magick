@@ -95,6 +95,7 @@ BEHENIAN_HIP = [
     ("Antares",       80763),   # Alpha Scorpii
     ("Vega",          91262),   # Alpha Lyrae
     ("Deneb Algedi", 107556),   # Delta Capricorni
+    ("Fomalhaut",    113368),   # Alpha Piscis Austrini
 ]
 
 BEHENIAN_ORB  = 6.0   # degrees — traditional influence orb
@@ -151,9 +152,16 @@ def ecl_separation(lon_a, lon_b):
 def find_conjunction_time(planet_name, star_name, start_date, eph, ts, observer,
                            topos, tz, max_days=366):
     """
-    Use Skyfield find_discrete to find the actual datetime when planet_name
-    is at minimum ecliptic separation from star_name, scanning forward up to
-    max_days from start_date.  Returns a datetime (local) or None.
+    Find the time of closest approach between planet_name and star_name within
+    max_days of start_date.
+
+    Strategy: sample ecliptic separation at 6-hour intervals across the full
+    window to find the global minimum.  Then ternary-refine to minute accuracy.
+
+    Returns the local datetime of closest approach if the planet is actually
+    approaching (minimum separation < current separation), else None.
+    Returning None means the planet is moving away — the caller should drop
+    the row.
     """
     stars    = get_behenian_stars()
     star_obj = next((s for n, s in stars if n == star_name), None)
@@ -168,63 +176,53 @@ def find_conjunction_time(planet_name, star_name, start_date, eph, ts, observer,
                           0, 0, 0, tzinfo=datetime.timezone.utc))
     t1 = ts.tt_jd(t0.tt + max_days)
 
-    # Build a function: separation in degrees (want to find minimum)
-    # find_discrete needs a 0/1 function; we use "sep < threshold" crossing
-    # Scan with 6-hour steps to find when sep < 3°, then refine with ternary search
+    def sep_at(tt):
+        t  = ts.tt_jd(tt)
+        p  = earth.at(t).observe(planet_obj).apparent()
+        s  = earth.at(t).observe(star_obj).apparent()
+        _, pl, _ = p.frame_latlon(ecliptic_frame)
+        _, sl, _ = s.frame_latlon(ecliptic_frame)
+        pv = pl.degrees % 360.0
+        sv = sl.degrees % 360.0
+        d  = abs(pv - sv) % 360.0
+        return d if d <= 180.0 else 360.0 - d
 
-    def sep_fn(t):
-        p_astr = earth.at(t).observe(planet_obj).apparent()
-        s_astr = earth.at(t).observe(star_obj).apparent()
-        _, p_lon, _ = p_astr.frame_latlon(ecliptic_frame)
-        _, s_lon, _ = s_astr.frame_latlon(ecliptic_frame)
-        p = p_lon.degrees % 360.0
-        s = s_lon.degrees % 360.0
-        diff = abs(p - s) % 360.0
-        sep = diff if diff <= 180.0 else 360.0 - diff
-        return sep < 3.0   # True when close
-    sep_fn.step_days = 0.25  # 6-hour steps
+    # Current separation (at start_date noon)
+    current_sep = sep_at(t0.tt + 0.5)  # noon on start_date
 
-    try:
-        times, flags = almanac.find_discrete(t0, t1, sep_fn)
-    except Exception:
+    # Sample every 6 hours to find the global minimum
+    n_steps   = int(max_days * 4)  # 4 samples/day
+    step      = (t1.tt - t0.tt) / n_steps
+    best_sep  = current_sep
+    best_tt   = t0.tt
+
+    for i in range(n_steps + 1):
+        tt  = t0.tt + i * step
+        sep = sep_at(tt)
+        if sep < best_sep:
+            best_sep = sep
+            best_tt  = tt
+
+    # If the minimum is not better than current, planet is moving away
+    if best_sep >= current_sep - 0.01:   # 0.01° tolerance for floating point
         return None
 
-    # Find the entry event (flag=True = just entered <3° zone)
-    for t_evt, flag in zip(times, flags):
-        if not flag:
-            continue
-        # Refine: ternary search for minimum separation in ±3-day window
-        lo_tt = max(t0.tt, t_evt.tt - 3)
-        hi_tt = min(t1.tt, t_evt.tt + 3)
-        try:
-            for _ in range(60):
-                span = hi_tt - lo_tt
-                if span < 1e-5:
-                    break
-                m1 = lo_tt + span / 3
-                m2 = hi_tt - span / 3
+    # Ternary-refine around the best sample (±2 days) to minute accuracy
+    lo = max(t0.tt, best_tt - 2.0)
+    hi = min(t1.tt, best_tt + 2.0)
+    for _ in range(60):
+        span = hi - lo
+        if span < 1e-5:          # ~1 second precision
+            break
+        m1 = lo + span / 3
+        m2 = hi - span / 3
+        if sep_at(m1) < sep_at(m2):
+            hi = m2
+        else:
+            lo = m1
 
-                def sep_at(tt):
-                    t  = ts.tt_jd(tt)
-                    p  = earth.at(t).observe(planet_obj).apparent()
-                    s  = earth.at(t).observe(star_obj).apparent()
-                    _, pl, _ = p.frame_latlon(ecliptic_frame)
-                    _, sl, _ = s.frame_latlon(ecliptic_frame)
-                    pv = pl.degrees % 360.0
-                    sv = sl.degrees % 360.0
-                    d  = abs(pv - sv) % 360.0
-                    return d if d <= 180.0 else 360.0 - d
-
-                if sep_at(m1) < sep_at(m2):
-                    hi_tt = m2
-                else:
-                    lo_tt = m1
-            t_min = ts.tt_jd((lo_tt + hi_tt) / 2)
-        except Exception:
-            t_min = t_evt
-        return t_min.utc_datetime().astimezone(tz)
-
-    return None
+    t_min = ts.tt_jd((lo + hi) / 2)
+    return t_min.utc_datetime().astimezone(tz)
 
 
 def behenian_aspects(planet_name, ecl_lon, retrograde, date, tz, eph, ts, observer, topos):
@@ -1048,19 +1046,20 @@ def print_report(eph, ts, date, lat, lon, tz):
     # [D] = daytime (Sun above horizon), [N] = nighttime
     # Column widths — header and data rows use identical format spec
     # so they cannot diverge.  All content is plain ASCII.
-    W = dict(body=11, sign=13, deg=6, rx=3, rise=5,
+    W = dict(body=11, sign=13, deg=6, rx=3, const=17, rise=5,
              transit=9, set_=6, anti=11, nvis=5, end=5)
 
-    def fmt_row(body, sign, deg, rx, rise, transit, set_, anti, nvis, end, note=''):
+    def fmt_row(body, sign, deg, rx, const, rise, transit, set_, anti, nvis, end, note=''):
         return (f"  {body:<{W['body']}} {sign:<{W['sign']}} {deg:>{W['deg']}}"
-                f"{rx:<{W['rx']}} {rise:>{W['rise']}} {transit:>{W['transit']}}"
-                f" {set_:>{W['set_']}} {anti:>{W['anti']}}  {nvis:>{W['nvis']}}  {end:>{W['end']}}"
+                f"{rx:<{W['rx']}} {const:<{W['const']}} {rise:>{W['rise']}}"
+                f" {transit:>{W['transit']}} {set_:>{W['set_']}} {anti:>{W['anti']}}"
+                f"  {nvis:>{W['nvis']}}  {end:>{W['end']}}"
                 + note)
 
-    hdr = fmt_row('BODY','SIGN','DEG','','RISE','TRANSIT','SET','ANTITRANSIT','NVIS','END')
+    hdr = fmt_row('BODY','SIGN','DEG','','CONSTELLATION    ','RISE','TRANSIT','SET','ANTITRANSIT','NVIS','END')
     width = len(hdr)
     bar   = "-" * width
-    print(f"  ASTROLOGICAL POSITIONS  (tropical zodiac)")
+    print(f"  POSITIONS  (tropical zodiac + IAU constellation)")
     print(bar)
     print(hdr)
     print(bar)
@@ -1101,7 +1100,9 @@ def print_report(eph, ts, date, lat, lon, tz):
         vis_start_str = fmt_time(vis_start, tz) if vis_start else " ----"
         vis_end_str   = fmt_time(vis_end,   tz) if vis_end   else " ----"
 
-        print(fmt_row(name, sign, f"{deg_in_sign:.1f}", rx_str,
+        constellation, const_pct = astronomical_constellation(ecl_lon)
+        const_str = f"{constellation} {const_pct}%"
+        print(fmt_row(name, sign, f"{deg_in_sign:.1f}", rx_str, const_str,
                        rise_str, cul_str, set_str, nad_str,
                        vis_start_str, vis_end_str, note))
         bodies_lon[name] = ecl_lon
@@ -1257,24 +1258,25 @@ def print_night_transit_report(eph, ts, start_date, lat, lon, tz):
     observer = eph["earth"] + topos
 
     # Same idea: define widths once, build header and rows with identical spec.
-    NW = dict(body=11, date=12, time=5, sign=13, deg=6, type_=14)
+    NW = dict(body=11, date=12, time=5, sign=13, deg=6, const=17, type_=14)
 
-    def fmt_nt(body, date, time, sign, deg, type_=''):
+    def fmt_nt(body, date, time, sign, deg, const, type_=''):
         base = (f"  {body:<{NW['body']}} {date:<{NW['date']}} {time:>{NW['time']}}"
-                f"  {sign:<{NW['sign']}} {deg:>{NW['deg']}}")
+                f"  {sign:<{NW['sign']}} {deg:>{NW['deg']}}"
+                f"  {const:<{NW['const']}}")
         if type_:
             return base + f"  {type_:<{NW['type_']}}"
         return base
 
-    nt_hdr = fmt_nt('BODY', 'DATE', 'TIME', 'SIGN', 'DEG')
-    width  = 70
-    bar    = "-" * width
+    nt_hdr = fmt_nt('BODY', 'DATE', 'TIME', 'SIGN', 'DEG', 'CONSTELLATION    ')
+    nt_width = len(nt_hdr)
+    bar    = "-" * nt_width
 
     print()
     print()
-    print("=" * width)
+    print("=" * nt_width)
     print(f"  NEXT NIGHT PEAK  (scanning up to 366 days from {start_date})")
-    print("=" * width)
+    print("=" * nt_width)
     print(nt_hdr)
     print(bar)
 
@@ -1282,7 +1284,7 @@ def print_night_transit_report(eph, ts, start_date, lat, lon, tz):
     planet_list = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn"]
     for name in planet_list:
         if name == "Sun":
-            print(fmt_nt('Sun', '---', '---', '---', '---', 'always daytime'))
+            print(fmt_nt('Sun', '---', '---', '---', '---', '---', 'always daytime'))
             continue
 
         if name == "Moon":
@@ -1293,10 +1295,11 @@ def print_night_transit_report(eph, ts, start_date, lat, lon, tz):
             if result_any:
                 sign        = zodiac_sign(result_any["ecl_lon"])
                 deg_in_sign = result_any["ecl_lon"] % 30
+                con, cpct   = astronomical_constellation(result_any["ecl_lon"])
                 date_str    = result_any["date"].strftime("%a %b %d")
                 time_str    = fmt_time(result_any["peak_utc"], tz)
                 type_str    = "transit   " if result_any["is_transit"] else "night peak"
-                print(fmt_nt("Moon", date_str, time_str, sign, f"{deg_in_sign:.1f}", type_str))
+                print(fmt_nt("Moon", date_str, time_str, sign, f"{deg_in_sign:.1f}", f"{con} {cpct}%", type_str))
             else:
                 print(f"  {'Moon':<{NW['body']}} no visibility in 366 days")
 
@@ -1307,10 +1310,11 @@ def print_night_transit_report(eph, ts, start_date, lat, lon, tz):
             if result_full:
                 sign        = zodiac_sign(result_full["ecl_lon"])
                 deg_in_sign = result_full["ecl_lon"] % 30
+                con, cpct   = astronomical_constellation(result_full["ecl_lon"])
                 date_str    = result_full["date"].strftime("%a %b %d")
                 time_str    = fmt_time(result_full["peak_utc"], tz)
                 type_str    = "transit   " if result_full["is_transit"] else "night peak"
-                print(fmt_nt("Full Moon", date_str, time_str, sign, f"{deg_in_sign:.1f}", type_str))
+                print(fmt_nt("Full Moon", date_str, time_str, sign, f"{deg_in_sign:.1f}", f"{con} {cpct}%", type_str))
             else:
                 print(f"  {'Full Moon':<{NW['body']}} none in 366 days")
 
@@ -1321,10 +1325,11 @@ def print_night_transit_report(eph, ts, start_date, lat, lon, tz):
             if result_new:
                 sign        = zodiac_sign(result_new["ecl_lon"])
                 deg_in_sign = result_new["ecl_lon"] % 30
+                con, cpct   = astronomical_constellation(result_new["ecl_lon"])
                 date_str    = result_new["date"].strftime("%a %b %d")
                 time_str    = fmt_time(result_new["peak_utc"], tz)
                 type_str    = "transit   " if result_new["is_transit"] else "night peak"
-                print(fmt_nt("New Moon", date_str, time_str, sign, f"{deg_in_sign:.1f}", type_str))
+                print(fmt_nt("New Moon", date_str, time_str, sign, f"{deg_in_sign:.1f}", f"{con} {cpct}%", type_str))
             else:
                 print(f"  {'New Moon':<{NW['body']}} none in 366 days")
             continue
@@ -1336,9 +1341,10 @@ def print_night_transit_report(eph, ts, start_date, lat, lon, tz):
             else:
                 sign        = zodiac_sign(result["ecl_lon"])
                 deg_in_sign = result["ecl_lon"] % 30
+                con, cpct   = astronomical_constellation(result["ecl_lon"])
                 date_str    = result["date"].strftime("%a %b %d")
                 time_str    = fmt_time(result["peak_utc"], tz)
-                print(fmt_nt(name, date_str, time_str, sign, f"{deg_in_sign:.1f}", 'night peak'))
+                print(fmt_nt(name, date_str, time_str, sign, f"{deg_in_sign:.1f}", f"{con} {cpct}%", 'night peak'))
             continue
 
         result = find_next_night_peak(eph, ts, name, start_date, observer, topos, tz)
@@ -1347,17 +1353,19 @@ def print_night_transit_report(eph, ts, start_date, lat, lon, tz):
             continue
         sign        = zodiac_sign(result["ecl_lon"])
         deg_in_sign = result["ecl_lon"] % 30
+        con, cpct   = astronomical_constellation(result["ecl_lon"])
         date_str    = result["date"].strftime("%a %b %d")
         time_str    = fmt_time(result["peak_utc"], tz)
         type_str    = "transit   " if result["is_transit"] else "night peak"
-        print(fmt_nt(name, date_str, time_str, sign, f"{deg_in_sign:.1f}", type_str))
+        print(fmt_nt(name, date_str, time_str, sign, f"{deg_in_sign:.1f}", f"{con} {cpct}%", type_str))
 
     print(bar)
     print(f"  transit    = upper meridian crossing (highest possible point)")
     print(f"  night peak = highest altitude during darkness (transit is in daytime)")
+    print(f"  CONSTELLATION = IAU boundary (J2000 ecliptic)")
     print()
     print()
-    print("=" * width)
+    print("=" * nt_width)
     print()
     print()
 
@@ -2444,36 +2452,22 @@ def output_json(args, eph, ts, start_date, lat, lon, tz):
     """Collect all requested reports into one JSON object and print it."""
     out = {}
 
-    # Always include daily almanac (one entry per --days)
+    # Build one entry per --days; each entry can include behenian aspects and night transit
     daily = []
     for i in range(args.days):
         d = start_date + datetime.timedelta(days=i)
-        daily.append(build_daily_json(eph, ts, d, lat, lon, tz))
+        entry = build_daily_json(eph, ts, d, lat, lon, tz)
+        if args.behenian:
+            entry["behenian"] = build_behenian_json(eph, ts, d, lat, lon, tz)["aspects"]
+        if args.nighttransit:
+            entry["night_transit"] = build_nighttransit_json(eph, ts, d, lat, lon, tz)
+            if args.behenian:
+                entry["behenian_night"] = build_behenian_night_json(eph, ts, d, lat, lon, tz)["stars"]
+        daily.append(entry)
     out["almanac"] = daily
-
-    if args.astronomical:
-        astro = []
-        for i in range(args.days):
-            d = start_date + datetime.timedelta(days=i)
-            astro.append(build_astronomical_json(eph, ts, d, lat, lon, tz))
-        out["astronomical"] = astro
-
-    if args.nighttransit:
-        out["night_transit"] = build_nighttransit_json(eph, ts, start_date, lat, lon, tz)
-        if args.astronomical:
-            out["astronomical_night_transit"] = build_astronomical_night_json(eph, ts, start_date, lat, lon, tz)
 
     if args.eclipses:
         out["eclipses"] = build_eclipses_json(eph, ts, start_date, lat, lon, tz)
-
-    if args.behenian:
-        beh = []
-        for i in range(args.days):
-            d = start_date + datetime.timedelta(days=i)
-            beh.append(build_behenian_json(eph, ts, d, lat, lon, tz))
-        out["behenian"] = beh
-        if args.nighttransit:
-            out["behenian_night"] = build_behenian_night_json(eph, ts, start_date, lat, lon, tz)
 
     print(json.dumps(out, indent=2, default=str))
 
@@ -2515,8 +2509,6 @@ Ephemeris:   de421.bsp (~17MB, downloaded automatically on first run)
                         help="Show next night transit for each planet")
     parser.add_argument("--eclipses",      action="store_true", default=False,
                         help="Show next partial and total lunar/solar eclipses")
-    parser.add_argument("--astronomical",  action="store_true", default=False,
-                        help="Show astronomical positions (IAU constellations)")
     parser.add_argument("--behenian",      action="store_true", default=False,
                         help="Show Behenian fixed star aspects (planets within 20 deg)")
     parser.add_argument("--json",          action="store_true", default=False,
@@ -2553,17 +2545,12 @@ Ephemeris:   de421.bsp (~17MB, downloaded automatically on first run)
     for i in range(args.days):
         d = start_date + datetime.timedelta(days=i)
         print_report(eph, ts, d, lat, lon, tz)
-        if args.astronomical:
-            print_astronomical_report(eph, ts, d, lat, lon, tz)
         if args.behenian:
             print_behenian_report(eph, ts, d, lat, lon, tz)
-
-    if args.nighttransit:
-        print_night_transit_report(eph, ts, start_date, lat, lon, tz)
-        if args.astronomical:
-            print_astronomical_night_report(eph, ts, start_date, lat, lon, tz)
-        if args.behenian:
-            print_behenian_night_report(eph, ts, start_date, lat, lon, tz)
+        if args.nighttransit:
+            print_night_transit_report(eph, ts, d, lat, lon, tz)
+            if args.behenian:
+                print_behenian_night_report(eph, ts, d, lat, lon, tz)
 
     if args.eclipses:
         print_eclipse_report(eph, ts, start_date, lat, lon, tz)
