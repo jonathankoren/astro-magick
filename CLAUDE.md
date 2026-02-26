@@ -81,19 +81,32 @@ Printed once per day (respects --days). Columns:
   DEG            Degrees within sign (0.0–29.9)
   Rx             " Rx" if retrograde, else blank
   CONSTELLATION  IAU constellation + % through it (e.g. "Gemini 72%")
-  RISE           Local time of horizon rise
+  RISE           Local time of horizon rise (today's arc)
   TRANSIT        Upper culmination. [D] = Sun up, [N] = Sun down
-  SET            Local time of horizon set
+  SET            Local time of horizon set (same arc as RISE, may be next day)
   ANTITRANSIT    Lower culmination (nadir). [D]/[N] as above
   NVIS           Start of night visibility window
   END            End of night visibility window
 
 Notes:
-- CONSTELLATION column sits between Rx and RISE
-- Longest constellation string: "Sagittarius 100%" = 16 chars; column width = 17
+- CONSTELLATION column sits between Rx and RISE; width = 17 chars
+- SET may show a time past midnight when the planet's arc crosses midnight
 - [D]/[N] tags are always 3 ASCII chars — no emoji
 - Circumpolar bodies show `----` for RISE/SET
 - All column content is pure ASCII; planet glyphs are non-padded decorative prefixes
+
+### Night visibility (NVIS / END)
+
+Computed by `planet_night_visibility()` as the overlap of the planet's
+rise→set arc with the night window (sunset → next sunrise). Four cases:
+
+  Planet rises during day, sets after midnight  → NVIS = sunset,    END = set time
+  Planet rises after sunset, sets after sunrise → NVIS = rise time, END = sunrise
+  Planet rises and sets entirely within night   → NVIS = rise time, END = set time
+  Planet rises and sets during day              → NVIS = ----,      END = ----
+
+If set_utc is None (planet still above horizon past the search window),
+NVIS/END fall back to sunset→sunrise.
 
 ### IAU ecliptic boundary data
 
@@ -105,6 +118,34 @@ The ecliptic crosses 13 constellations (Ophiuchus at 247.6–266.2°):
   Virgo       173.851      Libra       217.810     Scorpius    241.047
   Ophiuchus   247.638      Sagittarius 266.238     Capricornus 299.656
   Aquarius    327.488      Pisces      351.650 (resumes)
+
+---
+
+## find_events
+
+`find_events(eph, ts, name, date, observer, topos, tz)`
+
+Returns `(rise_utc, culmination_utc, set_utc, nadir_utc, status)`.
+
+### Search window and arc-pairing
+
+Uses a **36-hour window** (local midnight → next-day noon) for rise/set so that
+cross-midnight sets are always found (e.g. Jupiter rising at 13:20 and setting
+at 04:02 the following morning).
+
+Critical subtlety: a 36h window can find *two* sets — yesterday's arc ending at
+04:02 this morning AND today's arc ending at 04:02 tomorrow. Taking `[0]` naively
+gives the wrong (past) set. Solution:
+
+1. Compute today's transit first using a strict **24h window**
+2. Pick the **last rise at or before the transit** → `rise_utc`
+3. Pick the **first set after the transit** → `set_utc`
+
+This correctly pairs rise and set to the same arc regardless of whether the arc
+crosses midnight.
+
+Meridian transits (culmination/nadir) use the strict 24h window only, so they
+always reflect today's crossing and never pick up tomorrow's.
 
 ---
 
@@ -140,39 +181,39 @@ All three use `find_next_night_peak_moon_phase()`.
 ### Daily aspects table
 
 Runs once per day in the --days loop. Shows every planet that is within
-BEHENIAN_WARN (20°) of a Behenian star AND approaching it (i.e. Skyfield
-finds a closer approach in the future). Rows where the planet is moving away
-are silently dropped.
+BEHENIAN_WARN (20°) of a Behenian star AND approaching it. Rows where the
+planet is moving away are silently dropped.
 
   PLANET    Body name
   STAR      Behenian star name
   SEP       Current ecliptic separation in degrees
   STATUS    "IN ORB  <6 deg" (within traditional 6° orb) or "approaching"
-  APPROACH  Local datetime of closest approach (Skyfield-computed, not estimated)
+  APPROACH  Local datetime of closest approach (Skyfield-computed)
   VISIBLE   "night" if star is >15° from Sun; "solar glare" otherwise
+
+Multiple rows for one planet are correct — each is a distinct planet×star aspect.
 
 ### Conjunction time algorithm  (`find_conjunction_time`)
 
-Previous approach (find_discrete + 3° threshold) was wrong: if a planet
-approaches to only 6° it never crosses 3°, so find_discrete saw nothing and
-returned None → row was incorrectly dropped or labelled "none in 1 yr".
+Previous approach (find_discrete with a 3° crossing threshold) was wrong: if a
+planet approaches to only 5–6° it never crosses 3°, so find_discrete returned
+nothing → "none in 1 yr" or false "approaching" label.
 
 Current approach:
 1. Sample ecliptic separation every 6 hours across the full 366-day window
 2. Find the global minimum separation across all samples
-3. If minimum ≥ current separation (planet moving away) → return None → row dropped
-4. Otherwise ternary-refine the minimum to ~second accuracy (60 iterations, ±2 days)
+3. If minimum ≥ current separation → planet moving away → return None → row dropped
+4. Otherwise ternary-refine the minimum (60 iterations, ±2 days) to ~second accuracy
 5. Return the local datetime of closest approach
 
-This correctly handles all cases: prograde approach, retrograde approach,
-close passes that never reach a fixed threshold (like Mars/Fomalhaut at 5°),
-and bodies that are moving away.
+This correctly handles prograde approach, retrograde approach, shallow passes
+that never reach a fixed threshold, and moving-away cases.
 
 ### Star catalog  (16 stars)
 
-All stars identified by Hipparcos catalog number, loaded via
-`skyfield.data.hipparcos` + `skyfield.api.Star`. No hand-coded positions.
-Catalog cached in `_HIP_DF_CACHE` / `_BEHENIAN_STAR_CACHE` (loaded once per run).
+Identified by Hipparcos catalog number, loaded via `skyfield.data.hipparcos`
++ `skyfield.api.Star`. No hand-coded positions. Cached in `_HIP_DF_CACHE` /
+`_BEHENIAN_STAR_CACHE` (loaded once per run).
 
   Algol         HIP 14576   Beta Persei
   Alcyone       HIP 17702   Eta Tauri (Pleiades)
@@ -190,10 +231,6 @@ Catalog cached in `_HIP_DF_CACHE` / `_BEHENIAN_STAR_CACHE` (loaded once per run)
   Vega          HIP 91262   Alpha Lyrae
   Deneb Algedi  HIP 107556  Delta Capricorni
   Fomalhaut     HIP 113368  Alpha Piscis Austrini
-
-Multiple rows for one planet are normal and correct — each row is a distinct
-planet×star aspect. The Sun near both Deneb Algedi and Fomalhaut (which are
-~33° apart) will appear twice.
 
 ---
 
@@ -229,15 +266,14 @@ All ephemeris calls wrapped in try/except for DE421 boundary safety.
 
 ## --json output
 
-All reports packed into one JSON object. Each day in `"almanac"` contains
-the positions, and optionally `"behenian"` aspects and `"night_transit"` data
-for that specific day (respects --days correctly).
+All reports packed into one JSON object per run. Each day in `"almanac"` contains
+positions, and optionally behenian aspects and night transit data for that day.
 
-  out["almanac"]          always; list of one entry per --days day
-    entry["behenian"]     --behenian aspects for that day
-    entry["night_transit"] --nighttransit peaks scanning from that day
-    entry["behenian_night"] --behenian + --nighttransit star peaks from that day
-  out["eclipses"]         --eclipses
+  out["almanac"]              always; one entry per --days day
+    entry["behenian"]         --behenian aspects for that day
+    entry["night_transit"]    --nighttransit peaks scanning from that day
+    entry["behenian_night"]   --behenian + --nighttransit star peaks from that day
+  out["eclipses"]             --eclipses
 
 ---
 
@@ -264,7 +300,7 @@ All column content is pure ASCII. Planet/zodiac glyphs are non-padded prefixes.
   ecl_separation()                   Shortest angular distance (0–180°)
   find_conjunction_time()            Sampling-based actual conjunction datetime
   find_eclipses()                    Scan for lunar + solar eclipses
-  find_events()                      Rise, upper transit, set, lower transit
+  find_events()                      Rise, transit, set, nadir — with arc pairing
   find_next_night_peak()             Night peak dispatcher for planets
   find_next_night_peak_moon_phase()  Moon night peak for arbitrary elongation range
   find_next_night_transit_outer()    Bulk transit scan for Mars/Jupiter/Saturn
@@ -281,7 +317,7 @@ All column content is pure ASCII. Planet/zodiac glyphs are non-padded prefixes.
   night_peak_altitude()              30-min sampling + ternary refinement
   night_window()                     Compute sunset → next-sunrise window
   output_json()                      Collect all reports into one JSON object
-  planet_night_visibility()          Clip planet rise-set to night window
+  planet_night_visibility()          Overlap of planet arc with night window
   print_behenian_night_report()      --behenian --nighttransit star peak table
   print_behenian_report()            --behenian daily aspects table
   print_eclipse_report()             --eclipses table
@@ -294,8 +330,8 @@ All column content is pure ASCII. Planet/zodiac glyphs are non-padded prefixes.
 
 Note: `print_astronomical_report`, `print_astronomical_night_report`,
 `build_astronomical_json`, and `build_astronomical_night_json` remain in the
-file as dead code from the pre-merge era. They are not called anywhere and
-can be removed in a future cleanup pass.
+file as dead code from before the table merge. Not called anywhere; safe to
+remove in a future cleanup pass.
 
 ---
 
@@ -310,3 +346,5 @@ can be removed in a future cleanup pass.
   Retrograde:   ±6h finite difference on ecliptic longitude
   Eclipses:     Topocentric sep < 0.3° → classified total/annular
   Conjunction:  6h sampling across 366-day window + 60-iteration ternary refinement
+  Rise/set arc: Transit computed first (24h), then last-rise-before and
+                first-set-after selected to pair the correct arc

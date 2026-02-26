@@ -422,8 +422,12 @@ def find_events(eph, ts, name, date, observer, topos, tz):
     Returns (rise_utc, culmination_utc, set_utc, nadir_utc, status).
     Status is 'normal', 'circumpolar', or 'never'.
     """
+    # Search a 36-hour window starting at local midnight so that planets
+    # which rise during the day and set after midnight (e.g. Jupiter) still
+    # have their set time found.  The extra 12 hours beyond local midnight
+    # is trimmed to the next-day noon so transits beyond that are ignored.
     local_start = datetime.datetime(date.year, date.month, date.day,  0, 0, 0, tzinfo=tz)
-    local_end   = datetime.datetime(date.year, date.month, date.day, 23,59,59, tzinfo=tz)
+    local_end   = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz) + datetime.timedelta(days=1)
     t0 = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
     t1 = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
 
@@ -450,24 +454,41 @@ def find_events(eph, ts, name, date, observer, topos, tz):
                                                     horizon_degrees=horizon_deg)
 
     # Discard grazing events where the body didn't truly cross the horizon.
-    real_rises = [t for t, f in zip(rise_times, rise_flags) if f]
-    real_sets  = [t for t, f in zip(set_times,  set_flags)  if f]
+    real_rises = [t.utc_datetime() for t, f in zip(rise_times, rise_flags) if f]
+    real_sets  = [t.utc_datetime() for t, f in zip(set_times,  set_flags)  if f]
 
-    rise_utc = real_rises[0].utc_datetime() if real_rises else None
-    set_utc  = real_sets[0].utc_datetime()  if real_sets  else None
-
-    # --- Upper culmination (celestial noon) and lower culmination (celestial midnight) ---
-    # meridian_transits returns event=1 for upper transit, event=0 for lower transit.
+    # We want the rise/set pair that brackets TODAY's transit (culmination).
+    # Using [0] naively can grab a cross-midnight set from the previous night's
+    # arc (e.g. Jupiter already up at midnight, sets at 04:02, then rises again
+    # at 13:20 — real_sets[0] = 04:02 this morning, which is before tonight).
+    # Strategy: find today's transit first (24h window), then pick the last rise
+    # before it and the first set after it.
+    local_end_24h = datetime.datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=tz)
+    t1_24h = ts.from_datetime(local_end_24h.astimezone(datetime.timezone.utc))
     f_meridian = almanac.meridian_transits(eph, body, topos)
-    trans_times, trans_events = almanac.find_discrete(t0, t1, f_meridian)
+    trans_times_all, trans_events_all = almanac.find_discrete(t0, t1_24h, f_meridian)
 
-    culmination_utc = None  # highest point — celestial noon
-    nadir_utc       = None  # lowest point  — celestial midnight
-    for t, event in zip(trans_times, trans_events):
+    culmination_utc = None
+    nadir_utc       = None
+    for t, event in zip(trans_times_all, trans_events_all):
         if event == 1 and culmination_utc is None:
             culmination_utc = t.utc_datetime()
         elif event == 0 and nadir_utc is None:
             nadir_utc = t.utc_datetime()
+
+    if culmination_utc is not None:
+        # Last rise at or before the transit
+        rises_before = [r for r in real_rises if r <= culmination_utc]
+        rise_utc = rises_before[-1] if rises_before else None
+        # First set after the transit
+        sets_after = [s for s in real_sets if s > culmination_utc]
+        set_utc = sets_after[0] if sets_after else None
+    else:
+        # No transit today — fall back to first rise/set in the window
+        rise_utc = real_rises[0] if real_rises else None
+        set_utc  = real_sets[0]  if real_sets  else None
+
+    # (culmination_utc and nadir_utc already computed above alongside rise/set)
 
     # --- Circumpolar / never-rises detection ---
     if rise_utc is None and set_utc is None:
@@ -614,22 +635,49 @@ def night_window(sunrise_utc, sunset_utc, date, tz, ts, observer, sun_body):
 
 def planet_night_visibility(rise_utc, set_utc, status, night_start, night_end):
     """
-    Given a planet's rise/set and the night window, return
-    (vis_start_utc, vis_end_utc) for the overlap, or (None, None) if none.
+    Given a planet's rise/set and the night window [night_start, night_end],
+    return (vis_start_utc, vis_end_utc) for the overlap, or (None, None).
+
+    All four datetimes are UTC-aware.  rise_utc / set_utc come from a 36-hour
+    search window so cross-midnight sets are present when they exist.
+
+    Cases handled:
+      - Rises during day, sets after midnight  → NVIS = sunset,    END = set or sunrise
+      - Rises after sunset, sets after sunrise → NVIS = rise,      END = sunrise
+      - Rises and sets entirely within night   → NVIS = rise,      END = set
+      - Rises and sets entirely during day     → no night overlap  → (None, None)
+      - Circumpolar                            → whole night
+      - Never rises                            → (None, None)
     """
     if night_start is None or night_end is None:
         return None, None
     if status == "never":
         return None, None
     if status == "circumpolar":
-        # Always up — visible the whole night
         return night_start, night_end
 
-    # Normal case: clip [rise, set] to [night_start, night_end]
-    if rise_utc is None or set_utc is None:
-        return None, None
-    vis_start = max(rise_utc, night_start)
-    vis_end   = min(set_utc,  night_end)
+    # Ensure UTC-aware for comparison
+    def _utc(dt):
+        if dt is None:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+    rise  = _utc(rise_utc)
+    set_  = _utc(set_utc)
+    ns    = _utc(night_start)
+    ne    = _utc(night_end)
+
+    # Planet is above horizon during the night if:
+    #   rise < night_end  AND  (set is None OR set > night_start)
+    # (set None means it rose but hasn't set within the search window — treat as still up)
+    if rise is not None and rise >= ne:
+        return None, None   # rises after night ends
+    if set_ is not None and set_ <= ns:
+        return None, None   # sets before night starts
+
+    vis_start = max(rise, ns)  if rise  is not None else ns
+    vis_end   = min(set_, ne)  if set_  is not None else ne
+
     if vis_end <= vis_start:
         return None, None
     return vis_start, vis_end
@@ -1008,8 +1056,12 @@ def print_report(eph, ts, date, lat, lon, tz):
     if eclipse_warnings:
         print()
 
+    # Search a 36-hour window starting at local midnight so that planets
+    # which rise during the day and set after midnight (e.g. Jupiter) still
+    # have their set time found.  The extra 12 hours beyond local midnight
+    # is trimmed to the next-day noon so transits beyond that are ignored.
     local_start = datetime.datetime(date.year, date.month, date.day,  0, 0, 0, tzinfo=tz)
-    local_end   = datetime.datetime(date.year, date.month, date.day, 23,59,59, tzinfo=tz)
+    local_end   = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz) + datetime.timedelta(days=1)
     t0 = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
     t1 = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
 
@@ -1142,8 +1194,12 @@ def print_astronomical_report(eph, ts, date, lat, lon, tz):
     local_noon = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz)
     t_noon     = ts.from_datetime(local_noon.astimezone(datetime.timezone.utc))
 
+    # Search a 36-hour window starting at local midnight so that planets
+    # which rise during the day and set after midnight (e.g. Jupiter) still
+    # have their set time found.  The extra 12 hours beyond local midnight
+    # is trimmed to the next-day noon so transits beyond that are ignored.
     local_start = datetime.datetime(date.year, date.month, date.day,  0, 0, 0, tzinfo=tz)
-    local_end   = datetime.datetime(date.year, date.month, date.day, 23,59,59, tzinfo=tz)
+    local_end   = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz) + datetime.timedelta(days=1)
     t0 = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
     t1 = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
 
@@ -1629,8 +1685,12 @@ def print_behenian_report(eph, ts, date, lat, lon, tz):
     local_noon = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz)
     t_noon     = ts.from_datetime(local_noon.astimezone(datetime.timezone.utc))
 
+    # Search a 36-hour window starting at local midnight so that planets
+    # which rise during the day and set after midnight (e.g. Jupiter) still
+    # have their set time found.  The extra 12 hours beyond local midnight
+    # is trimmed to the next-day noon so transits beyond that are ignored.
     local_start = datetime.datetime(date.year, date.month, date.day,  0, 0, 0, tzinfo=tz)
-    local_end   = datetime.datetime(date.year, date.month, date.day, 23,59,59, tzinfo=tz)
+    local_end   = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz) + datetime.timedelta(days=1)
     t0 = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
     t1 = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
 
@@ -1746,8 +1806,12 @@ def build_behenian_json(eph, ts, date, lat, lon, tz):
     local_noon = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz)
     t_noon     = ts.from_datetime(local_noon.astimezone(datetime.timezone.utc))
 
+    # Search a 36-hour window starting at local midnight so that planets
+    # which rise during the day and set after midnight (e.g. Jupiter) still
+    # have their set time found.  The extra 12 hours beyond local midnight
+    # is trimmed to the next-day noon so transits beyond that are ignored.
     local_start = datetime.datetime(date.year, date.month, date.day,  0, 0, 0, tzinfo=tz)
-    local_end   = datetime.datetime(date.year, date.month, date.day, 23,59,59, tzinfo=tz)
+    local_end   = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz) + datetime.timedelta(days=1)
     t0 = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
     t1 = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
 
@@ -2190,8 +2254,12 @@ def build_daily_json(eph, ts, date, lat, lon, tz):
     local_noon = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz)
     t_noon     = ts.from_datetime(local_noon.astimezone(datetime.timezone.utc))
 
+    # Search a 36-hour window starting at local midnight so that planets
+    # which rise during the day and set after midnight (e.g. Jupiter) still
+    # have their set time found.  The extra 12 hours beyond local midnight
+    # is trimmed to the next-day noon so transits beyond that are ignored.
     local_start = datetime.datetime(date.year, date.month, date.day,  0, 0, 0, tzinfo=tz)
-    local_end   = datetime.datetime(date.year, date.month, date.day, 23,59,59, tzinfo=tz)
+    local_end   = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz) + datetime.timedelta(days=1)
     t0 = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
     t1 = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
 
@@ -2349,8 +2417,12 @@ def build_astronomical_json(eph, ts, date, lat, lon, tz):
     local_noon = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz)
     t_noon     = ts.from_datetime(local_noon.astimezone(datetime.timezone.utc))
 
+    # Search a 36-hour window starting at local midnight so that planets
+    # which rise during the day and set after midnight (e.g. Jupiter) still
+    # have their set time found.  The extra 12 hours beyond local midnight
+    # is trimmed to the next-day noon so transits beyond that are ignored.
     local_start = datetime.datetime(date.year, date.month, date.day,  0, 0, 0, tzinfo=tz)
-    local_end   = datetime.datetime(date.year, date.month, date.day, 23,59,59, tzinfo=tz)
+    local_end   = datetime.datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=tz) + datetime.timedelta(days=1)
     t0 = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
     t1 = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
 
