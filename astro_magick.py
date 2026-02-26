@@ -1602,52 +1602,59 @@ def find_eclipses(eph, ts, start_date, observer, tz):
             break
 
     # ── Solar eclipses ────────────────────────────────────────────────────
-    def near_new_moon(t):
-        try:
-            e = earth.at(t)
-            sep = e.observe(moon_body).apparent().separation_from(
-                  e.observe(sun_body).apparent()).degrees
-            return sep < 2.0
-        except Exception:
-            return False
-    near_new_moon.step_days = 25.0
+    # Strategy: find every new moon using almanac.moon_phases (accurate to the
+    # second), then check topocentric Sun-Moon separation at each one.
+    # The old approach used find_discrete with step_days=25, which misses ~96%
+    # of new moons (detection window ~1 day, step 25 days → 4% hit rate).
+    #
+    # Eclipse classification (topocentric separation at closest approach):
+    #   < 0.3°  Total or Annular (Moon covers most/all of Sun's disc)
+    #   < 1.5°  Partial (Moon partially overlaps Sun's disc as seen from location)
+    #   >= 1.5° No eclipse at this location (may be eclipse elsewhere on Earth)
+    #
+    # We search ±2 days around each new moon for the topocentric minimum.
 
-    try:
-        events, flags = almanac.find_discrete(t0, t1, near_new_moon)
-    except Exception:
-        events, flags = [], []
-
-    def sep_at(t):
+    def topo_sep_at(t):
+        """Topocentric angular separation Sun-Moon at observer location."""
         obs = observer.at(t)
         return obs.observe(moon_body).apparent().separation_from(
                obs.observe(sun_body).apparent()).degrees
 
-    for t_evt, flag in zip(events, flags):
-        if not flag:
+    try:
+        nm_times, nm_phases = almanac.find_discrete(t0, t1,
+            almanac.moon_phases(eph))
+    except Exception:
+        nm_times, nm_phases = [], []
+
+    for t_nm, phase in zip(nm_times, nm_phases):
+        if int(phase) != 0:          # 0 = New Moon in Skyfield moon_phases
             continue
-        # Clamp ternary search window strictly within DE421 limit
-        lo_tt = max(t0.tt, t_evt.tt - 2)
-        hi_tt = min(DE421_LIMIT_TT, t_evt.tt + 2)
+        if t_nm.tt >= DE421_LIMIT_TT:
+            break
+
+        # Ternary search for topocentric minimum within ±2 days of new moon
+        lo_tt = max(t0.tt, t_nm.tt - 2.0)
+        hi_tt = min(DE421_LIMIT_TT, t_nm.tt + 2.0)
         if lo_tt >= hi_tt:
             continue
         try:
-            for _ in range(50):
+            for _ in range(60):
                 span = hi_tt - lo_tt
                 if span < 1e-6:
                     break
-                m1 = ts.tt_jd(lo_tt + span / 3)
-                m2 = ts.tt_jd(hi_tt - span / 3)
-                if sep_at(m1) > sep_at(m2):
-                    lo_tt = lo_tt + span / 3
+                m1_tt = lo_tt + span / 3
+                m2_tt = hi_tt - span / 3
+                if topo_sep_at(ts.tt_jd(m1_tt)) > topo_sep_at(ts.tt_jd(m2_tt)):
+                    lo_tt = m1_tt
                 else:
-                    hi_tt = hi_tt - span / 3
+                    hi_tt = m2_tt
             t_min   = ts.tt_jd((lo_tt + hi_tt) / 2)
-            min_sep = sep_at(t_min)
+            min_sep = topo_sep_at(t_min)
         except Exception:
             continue
 
-        if min_sep > 1.5:
-            continue
+        if min_sep >= 1.5:
+            continue        # no eclipse at this location
 
         is_total = min_sep < 0.3
         kind_str = "Total/Annular" if is_total else "Partial"
