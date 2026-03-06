@@ -2198,6 +2198,172 @@ def build_behenian_night_json(eph, ts, start_date, lat, lon, tz):
     }
 
 
+# ─────────────────────────────────────────────
+#  EQUINOX / SOLSTICE REPORT
+# ─────────────────────────────────────────────
+
+def find_next_seasons(eph, ts, start_date, max_years=3):
+    """
+    Return a list of the next occurrence of each of the four solar turning
+    points, scanning up to max_years ahead from start_date.
+
+    Returns a list of dicts sorted by date:
+        {name, t, date_utc}
+    where name is one of:
+        "Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice"
+    and t is a Skyfield Time object at the exact moment.
+
+    Skyfield's seasons() function returns the four events in one year.
+    We scan multiple years to find the NEXT occurrence of each.
+    """
+    # Skyfield season indices: 0=Spring Equinox, 1=Summer Solstice,
+    #                          2=Autumnal Equinox, 3=Winter Solstice
+    SEASON_NAMES = {
+        0: "Spring Equinox",
+        1: "Summer Solstice",
+        2: "Autumnal Equinox",
+        3: "Winter Solstice",
+    }
+
+    t0 = ts.utc(start_date.year, start_date.month, start_date.day)
+    t1 = ts.utc(start_date.year + max_years, start_date.month, start_date.day)
+
+    try:
+        season_times, season_idxs = almanac.find_discrete(t0, t1,
+            almanac.seasons(eph))
+    except Exception:
+        return []
+
+    results = {}
+    for t, idx in zip(season_times, season_idxs):
+        key = int(idx)
+        if key not in results:
+            results[key] = {
+                "name":     SEASON_NAMES[key],
+                "t":        t,
+                "date_utc": t.utc_datetime(),
+            }
+        if len(results) == 4:
+            break
+
+    return sorted(results.values(), key=lambda r: r["date_utc"])
+
+
+def print_equinox_report(eph, ts, start_date, lat, lon, tz):
+    """
+    Print a table of the next spring equinox, summer solstice, autumnal equinox,
+    and winter solstice, showing:
+      - Local date and time of the event
+      - Local time of solar noon (Sun at highest point) on that day
+      - Moon phase name and illumination % on that day
+    """
+    lon_sign = E if lon >= 0 else -E
+    topos    = wgs84.latlon(lat * N, abs(lon) * lon_sign)
+    observer = eph["earth"] + topos
+    earth    = eph["earth"]
+
+    seasons  = find_next_seasons(eph, ts, start_date)
+
+    width = 70
+    bar   = "-" * width
+
+    # Column widths
+    EW = dict(name=18, date=16, time=5, noon=5, phase=18, illum=5)
+
+    def fmt_erow(name, date, time, noon, phase, illum):
+        return (f"  {name:<{EW['name']}} {date:<{EW['date']}} {time:>{EW['time']}}"
+                f"  {noon:>{EW['noon']}}  {phase:<{EW['phase']}} {illum:>{EW['illum']}}")
+
+    hdr = fmt_erow("EVENT", "DATE", "TIME", "NOON", "MOON PHASE", "ILLUM")
+
+    print()
+    print()
+    print("=" * width)
+    print(f"  EQUINOXES & SOLSTICES  (next occurrence from {start_date})")
+    print("=" * width)
+    print(hdr)
+    print(bar)
+
+    for s in seasons:
+        local_dt  = s["date_utc"].astimezone(tz)
+        date_str  = local_dt.strftime("%a %b %d, %Y")
+        time_str  = local_dt.strftime("%H:%M")
+        d         = local_dt.date()
+
+        # Solar noon: find upper meridian transit of the Sun on this date
+        local_start = datetime.datetime(d.year, d.month, d.day,  0, 0, 0, tzinfo=tz)
+        local_end   = datetime.datetime(d.year, d.month, d.day, 23,59,59, tzinfo=tz)
+        t0_day = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
+        t1_day = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
+        sun_body = eph[SKYFIELD_NAMES["Sun"]]
+        try:
+            f_mer = almanac.meridian_transits(eph, sun_body, topos)
+            tt, te = almanac.find_discrete(t0_day, t1_day, f_mer)
+            noon_utc = next((t.utc_datetime() for t, e in zip(tt, te) if int(e) == 1), None)
+        except Exception:
+            noon_utc = None
+        noon_str = noon_utc.astimezone(tz).strftime("%H:%M") if noon_utc else "  ---"
+
+        # Moon phase on this day (at local noon)
+        local_noon = datetime.datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=tz)
+        t_noon = ts.from_datetime(local_noon.astimezone(datetime.timezone.utc))
+        phase_name, illum_pct = get_moon_phase(eph, ts, t_noon)
+        illum_str = f"{illum_pct}%"
+
+        print(fmt_erow(s["name"], date_str, time_str, noon_str, phase_name, illum_str))
+
+    print(bar)
+    print("  TIME  = local time the Sun reaches exact equinox/solstice point")
+    print("  NOON  = local solar noon (Sun at highest altitude) on that day")
+    print("  ILLUM = Moon illumination % at local noon")
+    print()
+    print()
+    print("=" * width)
+    print()
+    print()
+
+
+def build_equinox_json(eph, ts, start_date, lat, lon, tz):
+    """Return equinox/solstice data as a list for --json output."""
+    lon_sign = E if lon >= 0 else -E
+    topos    = wgs84.latlon(lat * N, abs(lon) * lon_sign)
+    observer = eph["earth"] + topos
+
+    seasons = find_next_seasons(eph, ts, start_date)
+    rows    = []
+
+    for s in seasons:
+        local_dt = s["date_utc"].astimezone(tz)
+        d        = local_dt.date()
+
+        local_start = datetime.datetime(d.year, d.month, d.day,  0, 0, 0, tzinfo=tz)
+        local_end   = datetime.datetime(d.year, d.month, d.day, 23,59,59, tzinfo=tz)
+        t0_day = ts.from_datetime(local_start.astimezone(datetime.timezone.utc))
+        t1_day = ts.from_datetime(local_end.astimezone(datetime.timezone.utc))
+        sun_body = eph[SKYFIELD_NAMES["Sun"]]
+        try:
+            f_mer = almanac.meridian_transits(eph, sun_body, topos)
+            tt, te = almanac.find_discrete(t0_day, t1_day, f_mer)
+            noon_utc = next((t.utc_datetime() for t, e in zip(tt, te) if int(e) == 1), None)
+        except Exception:
+            noon_utc = None
+
+        local_noon = datetime.datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=tz)
+        t_noon = ts.from_datetime(local_noon.astimezone(datetime.timezone.utc))
+        phase_name, illum_pct = get_moon_phase(eph, ts, t_noon)
+
+        rows.append({
+            "event":        s["name"],
+            "date":         d.isoformat(),
+            "time_local":   _fmt_local(s["date_utc"], tz),
+            "solar_noon":   _fmt_local(noon_utc, tz) if noon_utc else None,
+            "moon_phase":   phase_name,
+            "moon_illum":   illum_pct,
+        })
+
+    return rows
+
+
 def print_eclipse_report(eph, ts, start_date, lat, lon, tz):
     """Print next partial and total eclipses (lunar and solar)."""
     lon_sign = E if lon >= 0 else -E
@@ -2548,6 +2714,9 @@ def output_json(args, eph, ts, start_date, lat, lon, tz):
     if args.eclipses:
         out["eclipses"] = build_eclipses_json(eph, ts, start_date, lat, lon, tz)
 
+    if args.equinoxes:
+        out["equinoxes"] = build_equinox_json(eph, ts, start_date, lat, lon, tz)
+
     print(json.dumps(out, indent=2, default=str))
 
 
@@ -2590,6 +2759,8 @@ Ephemeris:   de421.bsp (~17MB, downloaded automatically on first run)
                         help="Show next partial and total lunar/solar eclipses")
     parser.add_argument("--behenian",      action="store_true", default=False,
                         help="Show Behenian fixed star aspects (planets within 20 deg)")
+    parser.add_argument("--equinoxes",      action="store_true", default=False,
+                        help="Show next equinoxes and solstices with solar noon and moon phase")
     parser.add_argument("--json",          action="store_true", default=False,
                         help="Output all requested reports as a single JSON object")
     args = parser.parse_args()
@@ -2633,6 +2804,9 @@ Ephemeris:   de421.bsp (~17MB, downloaded automatically on first run)
 
     if args.eclipses:
         print_eclipse_report(eph, ts, start_date, lat, lon, tz)
+
+    if args.equinoxes:
+        print_equinox_report(eph, ts, start_date, lat, lon, tz)
 
 if __name__ == "__main__":
     main()

@@ -20,6 +20,7 @@ python3 astro_magick.py --nighttransit
 python3 astro_magick.py --behenian
 python3 astro_magick.py --behenian --nighttransit
 python3 astro_magick.py --eclipses
+python3 astro_magick.py --equinoxes
 python3 astro_magick.py --json | jq .
 ```
 
@@ -65,10 +66,11 @@ CLI flags `--lat`, `--lon`, `--timezone` override the config file.
   --nighttransit  Next night-time peak for each planet + Behenian star peaks (if --behenian)
   --behenian      Behenian fixed star aspects; with --nighttransit adds star peak table
   --eclipses      Next partial and total lunar/solar eclipses (up to 2053)
+  --equinoxes     Next spring/autumnal equinox and summer/winter solstice
   --json          All requested reports as a single JSON object to stdout
 
 All status/error messages go to stderr; stdout is clean for piping.
-There is no --astronomical flag; IAU constellation data appears in the main table.
+There is no --astronomical flag; IAU constellation data is in the main table.
 
 ---
 
@@ -105,8 +107,8 @@ rise→set arc with the night window (sunset → next sunrise). Four cases:
   Planet rises and sets entirely within night   → NVIS = rise time, END = set time
   Planet rises and sets during day              → NVIS = ----,      END = ----
 
-If set_utc is None (planet still above horizon past the search window),
-NVIS/END fall back to sunset→sunrise.
+If set_utc is None (planet still above horizon past search window),
+NVIS/END fall back to sunset → sunrise.
 
 ### IAU ecliptic boundary data
 
@@ -142,10 +144,7 @@ gives the wrong (past) set. Solution:
 3. Pick the **first set after the transit** → `set_utc`
 
 This correctly pairs rise and set to the same arc regardless of whether the arc
-crosses midnight.
-
-Meridian transits (culmination/nadir) use the strict 24h window only, so they
-always reflect today's crossing and never pick up tomorrow's.
+crosses midnight. Meridian transits (culmination/nadir) use the 24h window only.
 
 ---
 
@@ -176,6 +175,28 @@ All three use `find_next_night_peak_moon_phase()`.
 
 ---
 
+## EQUINOXES & SOLSTICES table  (--equinoxes)
+
+Shows the next occurrence of each of the four solar turning points from the
+start date, scanning up to 3 years forward.
+
+Columns:
+
+  EVENT   Spring Equinox / Summer Solstice / Autumnal Equinox / Winter Solstice
+  DATE    Local date (e.g. "Wed Mar 20, 2026")
+  TIME    Local time the Sun reaches the exact equinox/solstice point
+  NOON    Local solar noon (Sun's upper meridian transit) on that day
+  PHASE   Moon phase name at local noon
+  ILLUM   Moon illumination % at local noon
+
+Implementation:
+- `almanac.seasons(eph)` via `find_discrete` for exact event times
+- Solar noon found via `almanac.meridian_transits` upper transit (event=1)
+- Moon phase from `get_moon_phase()` at local noon on each event date
+- JSON key: `out["equinoxes"]` — list of 4 entries, one per event
+
+---
+
 ## BEHENIAN FIXED STARS  (--behenian)
 
 ### Daily aspects table
@@ -197,7 +218,7 @@ Multiple rows for one planet are correct — each is a distinct planet×star asp
 
 Previous approach (find_discrete with a 3° crossing threshold) was wrong: if a
 planet approaches to only 5–6° it never crosses 3°, so find_discrete returned
-nothing → "none in 1 yr" or false "approaching" label.
+nothing → false "approaching" label or dropped row.
 
 Current approach:
 1. Sample ecliptic separation every 6 hours across the full 366-day window
@@ -206,8 +227,8 @@ Current approach:
 4. Otherwise ternary-refine the minimum (60 iterations, ±2 days) to ~second accuracy
 5. Return the local datetime of closest approach
 
-This correctly handles prograde approach, retrograde approach, shallow passes
-that never reach a fixed threshold, and moving-away cases.
+Handles prograde approach, retrograde approach, shallow passes that never reach
+a fixed threshold, and moving-away cases.
 
 ### Star catalog  (16 stars)
 
@@ -259,14 +280,18 @@ Scans up to 2053-10-01 (DE421 limit) for:
   Solar  total     Next total or annular solar eclipse at location
 
 Lunar: `skyfield.eclipselib.lunar_eclipses()`.
-Solar: topocentric Sun–Moon separation scan + ternary refinement.
-All ephemeris calls wrapped in try/except for DE421 boundary safety.
+
+Solar: uses `almanac.moon_phases(eph)` to find every new moon precisely (the
+old approach used `find_discrete` with `step_days=25`, which missed ~96% of new
+moons since the sub-2° detection window is only ~1 day wide). For each new moon,
+a ternary search finds the topocentric Sun-Moon minimum within ±2 days.
+Thresholds: < 0.3° = Total/Annular, < 1.5° = Partial, ≥ 1.5° = no eclipse here.
 
 ---
 
 ## --json output
 
-All reports packed into one JSON object per run. Each day in `"almanac"` contains
+All reports packed into one JSON object. Each day in `"almanac"` contains
 positions, and optionally behenian aspects and night transit data for that day.
 
   out["almanac"]              always; one entry per --days day
@@ -274,14 +299,18 @@ positions, and optionally behenian aspects and night transit data for that day.
     entry["night_transit"]    --nighttransit peaks scanning from that day
     entry["behenian_night"]   --behenian + --nighttransit star peaks from that day
   out["eclipses"]             --eclipses
+  out["equinoxes"]            --equinoxes; list of 4 dicts (one per event)
+
+Each equinox entry: {event, date, time_local, solar_noon, moon_phase, moon_illum}
 
 ---
 
 ## Alignment
 
-Column widths defined in dicts (W, NW, BW, SNW) shared between header and all
-data rows via a single fmt_* closure — misalignment is structurally impossible.
-All column content is pure ASCII. Planet/zodiac glyphs are non-padded prefixes.
+Column widths defined in dicts (W, NW, BW, SNW, EW) shared between header and
+all data rows via a single fmt_* closure — misalignment is structurally
+impossible. All column content is pure ASCII. Planet/zodiac glyphs are
+non-padded prefixes only.
 
 ---
 
@@ -294,6 +323,7 @@ All column content is pure ASCII. Planet/zodiac glyphs are non-padded prefixes.
   build_behenian_night_json()        JSON for --behenian --nighttransit star peaks
   build_daily_json()                 JSON for one day's almanac entry
   build_eclipses_json()              JSON for --eclipses
+  build_equinox_json()               JSON for --equinoxes (4 seasonal events)
   build_nighttransit_json()          JSON for --nighttransit (one day)
   check_conjunctions()               Planet pairs within threshold degrees
   check_eclipses()                   Same-day eclipse warning for daily header
@@ -304,6 +334,7 @@ All column content is pure ASCII. Planet/zodiac glyphs are non-padded prefixes.
   find_next_night_peak()             Night peak dispatcher for planets
   find_next_night_peak_moon_phase()  Moon night peak for arbitrary elongation range
   find_next_night_transit_outer()    Bulk transit scan for Mars/Jupiter/Saturn
+  find_next_seasons()                Next 4 seasonal turning points via almanac.seasons
   find_next_star_night_peak()        Night peak for a Behenian Star object
   find_next_star_night_transit()     Next nighttime transit for a Star object
   find_star_night_peak()             Highest point within one night window
@@ -321,17 +352,20 @@ All column content is pure ASCII. Planet/zodiac glyphs are non-padded prefixes.
   print_behenian_night_report()      --behenian --nighttransit star peak table
   print_behenian_report()            --behenian daily aspects table
   print_eclipse_report()             --eclipses table
+  print_equinox_report()             --equinoxes table
   print_night_transit_report()       --nighttransit planet table
   print_report()                     Daily positions table
   star_alt_at()                      Altitude of a Star object at given TT JD
   zodiac_sign()                      Tropical sign from ecliptic longitude
+  _fmt_local()                       Format UTC datetime as local time string
   _get_night_window_for_day()        Sunset→sunrise helper for one calendar day
   _utc_in_night()                    Check if UTC datetime falls in night window
 
-Note: `print_astronomical_report`, `print_astronomical_night_report`,
-`build_astronomical_json`, and `build_astronomical_night_json` remain in the
-file as dead code from before the table merge. Not called anywhere; safe to
-remove in a future cleanup pass.
+Dead code (safe to remove in future cleanup):
+  print_astronomical_report()        Superseded by merged POSITIONS table
+  print_astronomical_night_report()  Superseded by merged NEXT NIGHT PEAK table
+  build_astronomical_json()          Superseded by merged JSON output
+  build_astronomical_night_json()    Superseded by merged JSON output
 
 ---
 
@@ -344,7 +378,8 @@ remove in a future cleanup pass.
                   Moon    +0.125°  (convention)
                   Planets -0.5667° (refraction only)
   Retrograde:   ±6h finite difference on ecliptic longitude
-  Eclipses:     Topocentric sep < 0.3° → classified total/annular
+  Eclipses:     Topocentric sep < 0.3° → total/annular; < 1.5° → partial
   Conjunction:  6h sampling across 366-day window + 60-iteration ternary refinement
   Rise/set arc: Transit computed first (24h), then last-rise-before and
                 first-set-after selected to pair the correct arc
+  Seasons:      almanac.seasons() via find_discrete — accurate to the second
